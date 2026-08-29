@@ -35,6 +35,9 @@ void libraw_bridge_set_grade(libraw_processor* p, libraw_grade grade);
 /* Set maximum output width; 0 keeps native size. */
 void libraw_bridge_set_max_width(libraw_processor* p, uint32_t width);
 
+/* Set noise reduction strength in the range 0...1; 0 disables it. */
+void libraw_bridge_set_denoise(libraw_processor* p, double strength);
+
 /* Develop the loaded RAW and write an 8-bit sRGB PNG to out_path.
    Returns 0 on success. */
 int libraw_bridge_develop_png(libraw_processor* p, const char* out_path);

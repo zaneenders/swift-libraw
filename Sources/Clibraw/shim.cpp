@@ -23,6 +23,7 @@ struct Processor {
     LibRaw raw;
     libraw_grade grade{};
     uint32_t maxWidth = 0;
+    double denoise = 0;
     std::string error;
 };
 
@@ -46,6 +47,141 @@ static void kelvinToRGB(double K, double& r, double& g, double& b) {
 
 static inline unsigned char clamp8(double v) {
     return (unsigned char)std::clamp(v + 0.5, 0.0, 255.0);
+}
+
+/* Strong chroma denoise in YCbCr. Severe night RAW noise perturbs measured
+   luma too, so an edge gate preserves the colored speckle. A separable box
+   filter removes low-frequency chroma efficiently while retaining each
+   pixel's original luminance, preserving stars and structural detail. */
+static void denoiseChroma(unsigned char* data, int W, int H, int chans, double strength) {
+    strength = std::clamp(strength, 0.0, 1.0);
+    if (strength <= 0 || W < 3 || H < 3 || chans < 3) return;
+
+    const size_t count = (size_t)W * H;
+    const int radius = 1 + (int)std::round(strength * 6.0);
+    const double blend = std::min(1.0, 0.4 + strength);
+    std::vector<float> chroma(count * 2);
+    std::vector<float> horizontal(count * 2);
+
+    for (size_t p = 0; p < count; ++p) {
+        const size_t i = p * chans;
+        const double r = data[i], g = data[i + 1], b = data[i + 2];
+        const double y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        chroma[p * 2] = (float)(b - y);
+        chroma[p * 2 + 1] = (float)(r - y);
+    }
+
+    for (int y = 0; y < H; ++y) {
+        double cb = 0, cr = 0;
+        int samples = 0;
+        for (int sx = 0; sx <= std::min(radius, W - 1); ++sx) {
+            const size_t p = ((size_t)y * W + sx) * 2;
+            cb += chroma[p]; cr += chroma[p + 1]; ++samples;
+        }
+        for (int x = 0; x < W; ++x) {
+            const size_t out = ((size_t)y * W + x) * 2;
+            horizontal[out] = (float)(cb / samples);
+            horizontal[out + 1] = (float)(cr / samples);
+            const int removeX = x - radius;
+            if (removeX >= 0) {
+                const size_t p = ((size_t)y * W + removeX) * 2;
+                cb -= chroma[p]; cr -= chroma[p + 1]; --samples;
+            }
+            const int addX = x + radius + 1;
+            if (addX < W) {
+                const size_t p = ((size_t)y * W + addX) * 2;
+                cb += chroma[p]; cr += chroma[p + 1]; ++samples;
+            }
+        }
+    }
+
+    for (int x = 0; x < W; ++x) {
+        double cb = 0, cr = 0;
+        int samples = 0;
+        for (int sy = 0; sy <= std::min(radius, H - 1); ++sy) {
+            const size_t p = ((size_t)sy * W + x) * 2;
+            cb += horizontal[p]; cr += horizontal[p + 1]; ++samples;
+        }
+        for (int y = 0; y < H; ++y) {
+            const size_t p = (size_t)y * W + x;
+            const size_t i = p * chans;
+            const double r = data[i], g = data[i + 1], b = data[i + 2];
+            const double luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            const double filteredCb = cb / samples;
+            const double filteredCr = cr / samples;
+            const double outputCb = chroma[p * 2] * (1.0 - blend) + filteredCb * blend;
+            const double outputCr = chroma[p * 2 + 1] * (1.0 - blend) + filteredCr * blend;
+            data[i] = clamp8(luma + outputCr);
+            data[i + 2] = clamp8(luma + outputCb);
+            data[i + 1] = clamp8((luma - 0.2126 * data[i] - 0.0722 * data[i + 2]) / 0.7152);
+
+            const int removeY = y - radius;
+            if (removeY >= 0) {
+                const size_t q = ((size_t)removeY * W + x) * 2;
+                cb -= horizontal[q]; cr -= horizontal[q + 1]; --samples;
+            }
+            const int addY = y + radius + 1;
+            if (addY < H) {
+                const size_t q = ((size_t)addY * W + x) * 2;
+                cb += horizontal[q]; cr += horizontal[q + 1]; ++samples;
+            }
+        }
+    }
+}
+
+/* Dark-adaptive luminance denoise. It is intentionally weaker than chroma
+   filtering so edges and stars remain visible while high-ISO grain settles. */
+static void denoiseLuma(unsigned char* data, int W, int H, int chans, double strength) {
+    if (strength <= 0 || W < 3 || H < 3 || chans < 3) return;
+    const size_t count = (size_t)W * H;
+    const int radius = 1 + (int)std::round(strength * 3.0);
+    std::vector<float> luma(count), horizontal(count);
+
+    for (size_t p = 0; p < count; ++p) {
+        const size_t i = p * chans;
+        luma[p] = (float)(0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2]);
+    }
+
+    for (int y = 0; y < H; ++y) {
+        double sum = 0;
+        int samples = 0;
+        for (int sx = 0; sx <= std::min(radius, W - 1); ++sx) {
+            sum += luma[(size_t)y * W + sx]; ++samples;
+        }
+        for (int x = 0; x < W; ++x) {
+            horizontal[(size_t)y * W + x] = (float)(sum / samples);
+            const int removeX = x - radius;
+            if (removeX >= 0) { sum -= luma[(size_t)y * W + removeX]; --samples; }
+            const int addX = x + radius + 1;
+            if (addX < W) { sum += luma[(size_t)y * W + addX]; ++samples; }
+        }
+    }
+
+    for (int x = 0; x < W; ++x) {
+        double sum = 0;
+        int samples = 0;
+        for (int sy = 0; sy <= std::min(radius, H - 1); ++sy) {
+            sum += horizontal[(size_t)sy * W + x]; ++samples;
+        }
+        for (int y = 0; y < H; ++y) {
+            const size_t p = (size_t)y * W + x;
+            const size_t i = p * chans;
+            const double originalY = luma[p];
+            const double filteredY = sum / samples;
+            const double darkness = std::clamp(1.0 - originalY / 180.0, 0.15, 1.0);
+            const double blend = strength * 0.8 * darkness;
+            const double outputY = originalY * (1.0 - blend) + filteredY * blend;
+            const double delta = outputY - originalY;
+            data[i] = clamp8(data[i] + delta);
+            data[i + 1] = clamp8(data[i + 1] + delta);
+            data[i + 2] = clamp8(data[i + 2] + delta);
+
+            const int removeY = y - radius;
+            if (removeY >= 0) { sum -= horizontal[(size_t)removeY * W + x]; --samples; }
+            const int addY = y + radius + 1;
+            if (addY < H) { sum += horizontal[(size_t)addY * W + x]; ++samples; }
+        }
+    }
 }
 
 /* Apply contrast/saturation/vibrance/shadows/highlights in sRGB space.
@@ -186,6 +322,10 @@ void libraw_bridge_set_max_width(libraw_processor* p, uint32_t w) {
     reinterpret_cast<Processor*>(p)->maxWidth = w;
 }
 
+void libraw_bridge_set_denoise(libraw_processor* p, double strength) {
+    reinterpret_cast<Processor*>(p)->denoise = std::clamp(strength, 0.0, 1.0);
+}
+
 int libraw_bridge_develop_png(libraw_processor* p, const char* out_path) {
     Processor* pp = reinterpret_cast<Processor*>(p);
     pp->error.clear();
@@ -196,6 +336,10 @@ int libraw_bridge_develop_png(libraw_processor* p, const char* out_path) {
     params.output_bps = 8;
     params.output_tiff = 0;
     params.user_flip = 0;     /* respect metadata orientation */
+    /* Do not let dcraw normalize every dark frame toward full brightness.
+       That behavior lifts the night noise floor by several stops and causes
+       frame-to-frame exposure pumping. Exposure belongs to the ramp. */
+    params.no_auto_bright = 1;
 
     /* Exposure shift in stops. */
     if (pp->grade.exposure != 0) {
@@ -252,6 +396,10 @@ int libraw_bridge_develop_png(libraw_processor* p, const char* out_path) {
     if (chans < 3) chans = 3;
 
     std::vector<unsigned char> pixels(image->data, image->data + image->data_size);
+
+    /* Remove color speckle and dark-region grain before grading amplifies it. */
+    denoiseChroma(pixels.data(), W, H, chans, pp->denoise);
+    denoiseLuma(pixels.data(), W, H, chans, pp->denoise);
 
     /* Post-demosaic color grading. */
     applyGrade(pixels.data(), W, H, chans, pp->grade);

@@ -1,8 +1,11 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.3
 import PackageDescription
 
 let package = Package(
     name: "swift-libraw",
+    platforms: [
+        .macOS(.v26),
+    ],
     products: [
         .library(name: "Libraw", targets: ["Libraw"]),
     ],
@@ -30,6 +33,14 @@ let package = Package(
                 .headerSearchPath("libraw"),
                 .define("LIBRAW_NOTHREADS"),
                 .define("USE_ZLIB"),
+            ],
+            cxxSettings: [
+                .unsafeFlags([
+                    "-std=c++17",
+                    "-Wno-deprecated-declarations",
+                    "-Wno-shorten-64-to-32",
+                    "-Wno-macro-redefined",
+                ]),
             ],
             linkerSettings: [
                 .linkedLibrary("z"),

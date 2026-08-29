@@ -89,6 +89,11 @@ public final class Libraw: @unchecked Sendable {
         libraw_bridge_set_max_width(handle, UInt32(max(0, width)))
     }
 
+    /// Edge-aware chroma noise reduction. Strength is clamped to `0...1`.
+    public func setDenoise(_ strength: Double) {
+        libraw_bridge_set_denoise(handle, min(1, max(0, strength)))
+    }
+
     public func developPNG(to path: String) throws {
         let rc = path.withCString { libraw_bridge_develop_png(handle, $0) }
         if rc != 0 {

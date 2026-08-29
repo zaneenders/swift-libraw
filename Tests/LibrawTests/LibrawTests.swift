@@ -21,4 +21,12 @@ struct LibrawTests {
         #expect(b.shadows == 0)
         #expect(b.highlights == 0)
     }
+
+    @Test("denoise setter accepts and clamps strengths")
+    func denoiseStrength() {
+        let raw = Libraw()
+        raw.setDenoise(-1)
+        raw.setDenoise(0.65)
+        raw.setDenoise(2)
+    }
 }
