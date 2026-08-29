@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -326,8 +327,8 @@ void libraw_bridge_set_denoise(libraw_processor* p, double strength) {
     reinterpret_cast<Processor*>(p)->denoise = std::clamp(strength, 0.0, 1.0);
 }
 
-int libraw_bridge_develop_png(libraw_processor* p, const char* out_path) {
-    Processor* pp = reinterpret_cast<Processor*>(p);
+static int developRGB(Processor* pp, std::vector<unsigned char>& output,
+                      int& outputWidth, int& outputHeight) {
     pp->error.clear();
     LibRaw& raw = pp->raw;
     libraw_output_params_t& params = raw.imgdata.params;
@@ -418,14 +419,65 @@ int libraw_bridge_develop_png(libraw_processor* p, const char* out_path) {
         finalH = newH;
     }
 
-    int stride = finalW * chans;
-    int ok = stbi_write_png(out_path, finalW, finalH, chans, finalPixels, stride);
+    // ffmpeg's rgb24 input requires exactly three tightly packed channels.
+    const size_t pixelCount = (size_t)finalW * finalH;
+    output.resize(pixelCount * 3);
+    if (chans == 3) {
+        std::memcpy(output.data(), finalPixels, output.size());
+    } else {
+        for (size_t pixel = 0; pixel < pixelCount; ++pixel) {
+            output[pixel * 3] = finalPixels[pixel * chans];
+            output[pixel * 3 + 1] = finalPixels[pixel * chans + 1];
+            output[pixel * 3 + 2] = finalPixels[pixel * chans + 2];
+        }
+    }
+    outputWidth = finalW;
+    outputHeight = finalH;
     raw.dcraw_clear_mem(image);
+    return LIBRAW_SUCCESS;
+}
+
+
+
+int libraw_bridge_develop_png(libraw_processor* p, const char* out_path) {
+    Processor* pp = reinterpret_cast<Processor*>(p);
+    std::vector<unsigned char> pixels;
+    int width = 0, height = 0;
+    int ret = developRGB(pp, pixels, width, height);
+    if (ret != LIBRAW_SUCCESS) return ret;
+    int ok = stbi_write_png(out_path, width, height, 3, pixels.data(), width * 3);
     if (!ok) {
         pp->error = "stbi_write_png failed";
         return LIBRAW_UNSPECIFIED_ERROR;
     }
     return LIBRAW_SUCCESS;
+}
+
+int libraw_bridge_develop_rgb(libraw_processor* p, libraw_rgb_image* out_image) {
+    if (!out_image) return LIBRAW_UNSPECIFIED_ERROR;
+    *out_image = {};
+    Processor* pp = reinterpret_cast<Processor*>(p);
+    std::vector<unsigned char> pixels;
+    int width = 0, height = 0;
+    int ret = developRGB(pp, pixels, width, height);
+    if (ret != LIBRAW_SUCCESS) return ret;
+
+    uint8_t* data = static_cast<uint8_t*>(std::malloc(pixels.size()));
+    if (!data) {
+        pp->error = "unable to allocate RGB output";
+        return LIBRAW_UNSUFFICIENT_MEMORY;
+    }
+    std::memcpy(data, pixels.data(), pixels.size());
+    out_image->data = data;
+    out_image->size = pixels.size();
+    out_image->width = (uint32_t)width;
+    out_image->height = (uint32_t)height;
+    out_image->channels = 3;
+    return LIBRAW_SUCCESS;
+}
+
+void libraw_bridge_free_rgb(uint8_t* data) {
+    std::free(data);
 }
 
 const char* libraw_bridge_last_error(libraw_processor* p) {

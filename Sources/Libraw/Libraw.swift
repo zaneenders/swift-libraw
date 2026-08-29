@@ -59,6 +59,19 @@ public struct LibrawGrade: Sendable {
     }
 }
 
+/// A tightly packed 8-bit sRGB image suitable for ffmpeg's `rgb24` input.
+public struct LibrawRGBImage: Sendable {
+    public let width: Int
+    public let height: Int
+    public let pixels: Data
+
+    public init(width: Int, height: Int, pixels: Data) {
+        self.width = width
+        self.height = height
+        self.pixels = pixels
+    }
+}
+
 public final class Libraw: @unchecked Sendable {
     private let handle: OpaquePointer
 
@@ -100,6 +113,25 @@ public final class Libraw: @unchecked Sendable {
             let msg = libraw_bridge_last_error(handle).map { String(cString: $0) } ?? ""
             throw LibrawError.developFailed(rc, msg)
         }
+    }
+
+    /// Develop into tightly packed, 8-bit sRGB pixels without PNG encoding.
+    public func developRGB() throws -> LibrawRGBImage {
+        var image = libraw_rgb_image()
+        let rc = libraw_bridge_develop_rgb(handle, &image)
+        if rc != 0 {
+            let msg = libraw_bridge_last_error(handle).map { String(cString: $0) } ?? ""
+            throw LibrawError.developFailed(rc, msg)
+        }
+        guard let bytes = image.data else {
+            throw LibrawError.message("libraw returned an empty RGB image")
+        }
+        defer { libraw_bridge_free_rgb(bytes) }
+        return LibrawRGBImage(
+            width: Int(image.width),
+            height: Int(image.height),
+            pixels: Data(bytes: bytes, count: image.size)
+        )
     }
 
     public static var version: String {

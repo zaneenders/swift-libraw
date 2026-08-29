@@ -12,6 +12,14 @@ extern "C" {
 typedef struct libraw_processor libraw_processor;
 
 typedef struct {
+    uint8_t* data;
+    size_t size;
+    uint32_t width;
+    uint32_t height;
+    uint32_t channels;
+} libraw_rgb_image;
+
+typedef struct {
     double exposure;     /* stops, 0 = unchanged */
     double temperature;  /* Kelvin, <= 0 = use camera WB */
     double tint;         /* green(+) / magenta(-), 0 = unchanged */
@@ -41,6 +49,11 @@ void libraw_bridge_set_denoise(libraw_processor* p, double strength);
 /* Develop the loaded RAW and write an 8-bit sRGB PNG to out_path.
    Returns 0 on success. */
 int libraw_bridge_develop_png(libraw_processor* p, const char* out_path);
+
+/* Develop the loaded RAW into a packed 8-bit sRGB pixel buffer.
+   The caller owns data and must release it with libraw_bridge_free_rgb. */
+int libraw_bridge_develop_rgb(libraw_processor* p, libraw_rgb_image* out_image);
+void libraw_bridge_free_rgb(uint8_t* data);
 
 /* Last error message, or NULL if no error. Valid until next call. */
 const char* libraw_bridge_last_error(libraw_processor* p);
