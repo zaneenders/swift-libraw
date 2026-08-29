@@ -1,0 +1,5 @@
+module Clibraw {
+    header "libraw_bridge.h"
+    link "z"
+    export *
+}
