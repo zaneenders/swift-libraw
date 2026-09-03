@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import Clibraw
 
 public enum LibrawError: Error, CustomStringConvertible {
@@ -74,6 +75,7 @@ public struct LibrawRGBImage: Sendable {
 
 public final class Libraw: @unchecked Sendable {
     private let handle: OpaquePointer
+    private let mutex = Mutex<Void>(())
 
     public init() {
         guard let h = libraw_bridge_new() else {
@@ -87,51 +89,61 @@ public final class Libraw: @unchecked Sendable {
     }
 
     public func open(_ path: String) throws {
-        let rc = path.withCString { libraw_bridge_open_file(handle, $0) }
-        if rc != 0 {
-            let msg = libraw_bridge_last_error(handle).map { String(cString: $0) } ?? ""
-            throw LibrawError.openFailed(rc, msg)
+        try mutex.withLock { _ in
+            let rc = path.withCString { libraw_bridge_open_file(handle, $0) }
+            if rc != 0 {
+                let msg = libraw_bridge_last_error(handle).map { String(cString: $0) } ?? ""
+                throw LibrawError.openFailed(rc, msg)
+            }
         }
     }
 
     public func setGrade(_ grade: LibrawGrade) {
-        libraw_bridge_set_grade(handle, grade.bridge())
+        mutex.withLock { _ in libraw_bridge_set_grade(handle, grade.bridge()) }
     }
 
     public func setMaxWidth(_ width: Int) {
-        libraw_bridge_set_max_width(handle, UInt32(max(0, width)))
+        let clamped = min(max(0, width), Int(UInt32.max))
+        mutex.withLock { _ in libraw_bridge_set_max_width(handle, UInt32(clamped)) }
     }
 
     /// Edge-aware chroma noise reduction. Strength is clamped to `0...1`.
     public func setDenoise(_ strength: Double) {
-        libraw_bridge_set_denoise(handle, min(1, max(0, strength)))
+        let finiteStrength = strength.isFinite ? strength : 0
+        mutex.withLock { _ in
+            libraw_bridge_set_denoise(handle, min(1, max(0, finiteStrength)))
+        }
     }
 
     public func developPNG(to path: String) throws {
-        let rc = path.withCString { libraw_bridge_develop_png(handle, $0) }
-        if rc != 0 {
-            let msg = libraw_bridge_last_error(handle).map { String(cString: $0) } ?? ""
-            throw LibrawError.developFailed(rc, msg)
+        try mutex.withLock { _ in
+            let rc = path.withCString { libraw_bridge_develop_png(handle, $0) }
+            if rc != 0 {
+                let msg = libraw_bridge_last_error(handle).map { String(cString: $0) } ?? ""
+                throw LibrawError.developFailed(rc, msg)
+            }
         }
     }
 
     /// Develop into tightly packed, 8-bit sRGB pixels without PNG encoding.
     public func developRGB() throws -> LibrawRGBImage {
-        var image = libraw_rgb_image()
-        let rc = libraw_bridge_develop_rgb(handle, &image)
-        if rc != 0 {
-            let msg = libraw_bridge_last_error(handle).map { String(cString: $0) } ?? ""
-            throw LibrawError.developFailed(rc, msg)
+        try mutex.withLock { _ in
+            var image = libraw_rgb_image()
+            let rc = libraw_bridge_develop_rgb(handle, &image)
+            if rc != 0 {
+                let msg = libraw_bridge_last_error(handle).map { String(cString: $0) } ?? ""
+                throw LibrawError.developFailed(rc, msg)
+            }
+            guard let bytes = image.data else {
+                throw LibrawError.message("libraw returned an empty RGB image")
+            }
+            defer { libraw_bridge_free_rgb(bytes) }
+            return LibrawRGBImage(
+                width: Int(image.width),
+                height: Int(image.height),
+                pixels: Data(bytes: bytes, count: image.size)
+            )
         }
-        guard let bytes = image.data else {
-            throw LibrawError.message("libraw returned an empty RGB image")
-        }
-        defer { libraw_bridge_free_rgb(bytes) }
-        return LibrawRGBImage(
-            width: Int(image.width),
-            height: Int(image.height),
-            pixels: Data(bytes: bytes, count: image.size)
-        )
     }
 
     public static var version: String {

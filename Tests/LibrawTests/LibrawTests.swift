@@ -22,11 +22,15 @@ struct LibrawTests {
         #expect(b.highlights == 0)
     }
 
-    @Test("denoise setter accepts and clamps strengths")
-    func denoiseStrength() {
+    @Test("numeric setters clamp extreme and non-finite inputs")
+    func numericSetters() {
         let raw = Libraw()
+        raw.setMaxWidth(-1)
+        raw.setMaxWidth(Int.max)
         raw.setDenoise(-1)
         raw.setDenoise(0.65)
         raw.setDenoise(2)
+        raw.setDenoise(.nan)
+        raw.setDenoise(.infinity)
     }
 }
