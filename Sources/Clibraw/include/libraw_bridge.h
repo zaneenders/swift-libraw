@@ -20,6 +20,14 @@ typedef struct {
 } libraw_rgb_image;
 
 typedef struct {
+    uint8_t* data;
+    size_t size;
+    uint32_t width;
+    uint32_t height;
+    uint32_t channels;
+} libraw_rgb16_image;
+
+typedef struct {
     double exposure;     /* stops, 0 = unchanged */
     double temperature;  /* Kelvin, <= 0 = use camera WB */
     double tint;         /* green(+) / magenta(-), 0 = unchanged */
@@ -53,6 +61,11 @@ int libraw_bridge_develop_png(libraw_processor* p, const char* out_path);
 /* Develop the loaded RAW into a packed 8-bit sRGB pixel buffer.
    The caller owns data and must release it with libraw_bridge_free_rgb. */
 int libraw_bridge_develop_rgb(libraw_processor* p, libraw_rgb_image* out_image);
+
+/* Develop the loaded RAW into packed 16-bit sRGB samples in little-endian
+   RGB channel order, suitable for FFmpeg's `rgb48le` input. The caller owns
+   data and must release it with libraw_bridge_free_rgb. */
+int libraw_bridge_develop_rgb16(libraw_processor* p, libraw_rgb16_image* out_image);
 void libraw_bridge_free_rgb(uint8_t* data);
 
 /* Last error message, or NULL if no error. Valid until next call. */
