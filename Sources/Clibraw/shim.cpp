@@ -46,33 +46,66 @@ static libraw_grade sanitizeGrade(libraw_grade grade) {
     return grade;
 }
 
-/* Tanner Helland's Kelvin -> RGB approximation, returned normalized to [0,1]. */
-static void kelvinToRGB(double K, double& r, double& g, double& b) {
-    double t = K / 100.0;
-    double red, green, blue;
-    if (t <= 66) {
-        red = 255.0;
-        green = 99.4708025861 * std::log(t) - 161.1195681661;
-        blue = (t <= 19) ? 0.0 : (138.5177312231 * std::log(t - 10) - 305.0447927307);
+/* Approximate a black-body illuminant as CIE xy (Hernandez-Andres et al.).
+   White-balance gains must be calculated in the camera's native color space;
+   display-space Kelvin RGB values are not sensor multipliers. */
+static void kelvinToXYZ(double kelvin, double& x, double& y, double& z) {
+    const double T = std::clamp(kelvin, 1667.0, 25000.0);
+    if (T <= 4000.0) {
+        x = -0.2661239e9 / (T * T * T) - 0.2343589e6 / (T * T)
+            + 0.8776956e3 / T + 0.179910;
     } else {
-        red = 329.698727446 * std::pow(t - 60, -0.1332047592);
-        green = 288.1221695283 * std::pow(t - 60, -0.0755148492);
-        blue = 255.0;
+        x = -3.0258469e9 / (T * T * T) + 2.1070379e6 / (T * T)
+            + 0.2226347e3 / T + 0.240390;
     }
-    r = std::clamp(red / 255.0, 0.0, 1.0);
-    g = std::clamp(green / 255.0, 0.0, 1.0);
-    b = std::clamp(blue / 255.0, 0.0, 1.0);
+    if (T <= 2222.0) {
+        y = -1.1063814 * x * x * x - 1.34811020 * x * x + 2.18555832 * x - 0.20219683;
+    } else if (T <= 4000.0) {
+        y = -0.9549476 * x * x * x - 1.37418593 * x * x + 2.09137015 * x - 0.16748867;
+    } else {
+        y = 3.0817580 * x * x * x - 5.87338670 * x * x + 3.75112997 * x - 0.37001483;
+    }
+    const double Y = 1.0;
+    const double X = x * Y / y;
+    const double Z = (1.0 - x - y) * Y / y;
+    x = X; y = Y; z = Z;
 }
 
-static inline unsigned char clamp8(double v) {
-    return (unsigned char)std::clamp(v + 0.5, 0.0, 255.0);
+static bool kelvinToCameraMultipliers(const LibRaw& raw, double kelvin,
+                                      double& r, double& g, double& b) {
+    double X, Y, Z;
+    kelvinToXYZ(kelvin, X, Y, Z);
+    const float (*cameraToXYZ)[3] = raw.imgdata.color.cam_xyz;
+    double cameraWhite[3] = {};
+    for (int channel = 0; channel < 3; ++channel) {
+        cameraWhite[channel] = cameraToXYZ[channel][0] * X
+            + cameraToXYZ[channel][1] * Y + cameraToXYZ[channel][2] * Z;
+    }
+    if (!std::isfinite(cameraWhite[0]) || !std::isfinite(cameraWhite[1])
+        || !std::isfinite(cameraWhite[2]) || cameraWhite[0] <= 0
+        || cameraWhite[1] <= 0 || cameraWhite[2] <= 0) {
+        return false;
+    }
+    r = 1.0 / cameraWhite[0];
+    g = 1.0 / cameraWhite[1];
+    b = 1.0 / cameraWhite[2];
+    const double minimum = std::min({r, g, b});
+    r /= minimum; g /= minimum; b /= minimum;
+    return true;
+}
+
+template <typename Sample>
+static inline Sample clampSample(double value, double maximum) {
+    return (Sample)std::clamp(value + 0.5, 0.0, maximum);
 }
 
 /* Strong chroma denoise in YCbCr. Severe night RAW noise perturbs measured
    luma too, so an edge gate preserves the colored speckle. A separable box
    filter removes low-frequency chroma efficiently while retaining each
    pixel's original luminance, preserving stars and structural detail. */
-static void denoiseChroma(unsigned char* data, int W, int H, int chans, double strength) {
+template <typename Sample>
+static void denoiseChroma(Sample* data, int W, int H, int chans, double strength,
+                          double maximum) {
     strength = std::clamp(strength, 0.0, 1.0);
     if (strength <= 0 || W < 3 || H < 3 || chans < 3) return;
 
@@ -130,9 +163,11 @@ static void denoiseChroma(unsigned char* data, int W, int H, int chans, double s
             const double filteredCr = cr / samples;
             const double outputCb = chroma[p * 2] * (1.0 - blend) + filteredCb * blend;
             const double outputCr = chroma[p * 2 + 1] * (1.0 - blend) + filteredCr * blend;
-            data[i] = clamp8(luma + outputCr);
-            data[i + 2] = clamp8(luma + outputCb);
-            data[i + 1] = clamp8((luma - 0.2126 * data[i] - 0.0722 * data[i + 2]) / 0.7152);
+            data[i] = clampSample<Sample>(luma + outputCr, maximum);
+            data[i + 2] = clampSample<Sample>(luma + outputCb, maximum);
+            data[i + 1] = clampSample<Sample>(
+                (luma - 0.2126 * data[i] - 0.0722 * data[i + 2]) / 0.7152,
+                maximum);
 
             const int removeY = y - radius;
             if (removeY >= 0) {
@@ -150,7 +185,9 @@ static void denoiseChroma(unsigned char* data, int W, int H, int chans, double s
 
 /* Dark-adaptive luminance denoise. It is intentionally weaker than chroma
    filtering so edges and stars remain visible while high-ISO grain settles. */
-static void denoiseLuma(unsigned char* data, int W, int H, int chans, double strength) {
+template <typename Sample>
+static void denoiseLuma(Sample* data, int W, int H, int chans, double strength,
+                        double maximum) {
     if (strength <= 0 || W < 3 || H < 3 || chans < 3) return;
     const size_t count = (size_t)W * H;
     const int radius = 1 + (int)std::round(strength * 3.0);
@@ -187,13 +224,14 @@ static void denoiseLuma(unsigned char* data, int W, int H, int chans, double str
             const size_t i = p * chans;
             const double originalY = luma[p];
             const double filteredY = sum / samples;
-            const double darkness = std::clamp(1.0 - originalY / 180.0, 0.15, 1.0);
+            const double darkness = std::clamp(
+                1.0 - originalY / (maximum * (180.0 / 255.0)), 0.15, 1.0);
             const double blend = strength * 0.8 * darkness;
             const double outputY = originalY * (1.0 - blend) + filteredY * blend;
             const double delta = outputY - originalY;
-            data[i] = clamp8(data[i] + delta);
-            data[i + 1] = clamp8(data[i + 1] + delta);
-            data[i + 2] = clamp8(data[i + 2] + delta);
+            data[i] = clampSample<Sample>(data[i] + delta, maximum);
+            data[i + 1] = clampSample<Sample>(data[i + 1] + delta, maximum);
+            data[i + 2] = clampSample<Sample>(data[i + 2] + delta, maximum);
 
             const int removeY = y - radius;
             if (removeY >= 0) { sum -= horizontal[(size_t)removeY * W + x]; --samples; }
@@ -204,8 +242,10 @@ static void denoiseLuma(unsigned char* data, int W, int H, int chans, double str
 }
 
 /* Apply contrast/saturation/vibrance/shadows/highlights in sRGB space.
-   Pixels are 8-bit, chans channels (3 or 4), row-major. */
-static void applyGrade(unsigned char* data, int W, int H, int chans, const libraw_grade& g) {
+   Samples use the supplied maximum, with chans channels in row-major order. */
+template <typename Sample>
+static void applyGrade(Sample* data, int W, int H, int chans, const libraw_grade& g,
+                       double maximum) {
     if (g.contrast == 1 && g.saturation == 1 && g.vibrance == 0 &&
         g.shadows == 0 && g.highlights == 0) {
         return;
@@ -219,9 +259,9 @@ static void applyGrade(unsigned char* data, int W, int H, int chans, const libra
     const size_t stride = (size_t)W * chans;
 
     for (int y = 0; y < H; ++y) {
-        unsigned char* row = data + (size_t)y * stride;
+        Sample* row = data + (size_t)y * stride;
         for (int x = 0; x < W; ++x) {
-            unsigned char* px = row + (size_t)x * chans;
+            Sample* px = row + (size_t)x * chans;
             double r = px[0], gg = px[1], b = px[2];
             double l = 0.2126 * r + 0.7152 * gg + 0.0722 * b;
 
@@ -248,7 +288,7 @@ static void applyGrade(unsigned char* data, int W, int H, int chans, const libra
                channel—to weight tonal masks, otherwise saturated blue/green
                pixels receive a very different grade from equally bright red
                pixels and visibly shift hue. */
-            double rn = r / 255.0, gn = gg / 255.0, bn = b / 255.0;
+            double rn = r / maximum, gn = gg / maximum, bn = b / maximum;
             const double toneLuma = std::clamp(
                 0.2126 * rn + 0.7152 * gn + 0.0722 * bn, 0.0, 1.0);
 
@@ -275,17 +315,18 @@ static void applyGrade(unsigned char* data, int W, int H, int chans, const libra
                 bn = (bn - 0.5) * contrast + 0.5;
             }
 
-            px[0] = clamp8(rn * 255.0);
-            px[1] = clamp8(gn * 255.0);
-            px[2] = clamp8(bn * 255.0);
+            px[0] = clampSample<Sample>(rn * maximum, maximum);
+            px[1] = clampSample<Sample>(gn * maximum, maximum);
+            px[2] = clampSample<Sample>(bn * maximum, maximum);
             if (hasAlpha) px[3] = px[3];
         }
     }
 }
 
 /* Simple bilinear downscale. */
-static void bilinearScale(const unsigned char* src, int sw, int sh, int chans,
-                          unsigned char* dst, int dw, int dh) {
+template <typename Sample>
+static void bilinearScale(const Sample* src, int sw, int sh, int chans,
+                          Sample* dst, int dw, int dh, double maximum) {
     const double sx = (double)sw / dw;
     const double sy = (double)sh / dh;
     for (int y = 0; y < dh; ++y) {
@@ -309,12 +350,197 @@ static void bilinearScale(const unsigned char* src, int sw, int sh, int chans,
                 double v11 = src[((size_t)y1 * sw + x1) * chans + c];
                 double v = (v00 * (1 - wx) + v01 * wx) * (1 - wy) +
                            (v10 * (1 - wx) + v11 * wx) * wy;
-                dst[((size_t)y * dw + x) * chans + c] = clamp8(v);
+                dst[((size_t)y * dw + x) * chans + c] =
+                    clampSample<Sample>(v, maximum);
             }
         }
     }
 }
 
+
+template <typename Sample>
+static int developRGB(Processor* pp, std::vector<Sample>& output,
+                      int& outputWidth, int& outputHeight, int outputBits) {
+    pp->error.clear();
+    output.clear();
+    outputWidth = 0;
+    outputHeight = 0;
+
+    if (pp->path.empty()) {
+        pp->error = "develop failed: no RAW file is open";
+        return LIBRAW_INPUT_CLOSED;
+    }
+
+    /* unpack()/dcraw_process() are a one-shot sequence in LibRaw. Reopen the
+       saved path before a subsequent development so PNG/RGB output and grade
+       retries work on the same processor instance. */
+    if (pp->needsReload) {
+        int ret = pp->raw.open_file(pp->path.c_str());
+        if (ret != LIBRAW_SUCCESS) {
+            pp->error = "reopen failed: ";
+            pp->error += libraw_strerror(ret);
+            return ret;
+        }
+        pp->needsReload = false;
+    }
+
+    /* Once unpack starts, retry through a clean reopen even when processing
+       fails partway through. */
+    pp->needsReload = true;
+
+    LibRaw& raw = pp->raw;
+    libraw_output_params_t& params = raw.imgdata.params;
+
+    params.output_color = 1;  /* sRGB */
+    params.output_bps = outputBits;
+    params.output_tiff = 0;
+    params.user_flip = -1;    /* respect metadata orientation */
+    /* Do not let dcraw normalize every dark frame toward full brightness.
+       That behavior lifts the night noise floor by several stops and causes
+       frame-to-frame exposure pumping. Exposure belongs to the ramp. */
+    params.no_auto_bright = 1;
+
+    /* LibRaw expects a linear multiplier, while the public API is in EV stops.
+       Passing EV directly made 0.5 EV darken by one stop and sent negative EV
+       values outside LibRaw's valid range, which can create severe channel
+       clipping and green/magenta flashes. */
+    if (pp->grade.exposure != 0) {
+        params.exp_correc = 1;
+        params.exp_shift = std::pow(2.0, std::clamp(pp->grade.exposure, -2.0, 3.0));
+        params.exp_preser = pp->grade.exposure > 0 ? 1.0 : 0.0;
+    } else {
+        params.exp_correc = 0;
+        params.exp_shift = 1.0;
+        params.exp_preser = 0.0;
+    }
+
+    /* White balance: convert the requested illuminant through the DNG camera
+       matrix. Feeding display-space RGB directly to user_mul caused the strong
+       green cast seen at otherwise ordinary temperatures such as 5200 K. */
+    if (pp->grade.temperature > 0) {
+        double r, g, b;
+        if (kelvinToCameraMultipliers(raw, pp->grade.temperature, r, g, b)) {
+            /* Tint: positive -> green, negative -> magenta. */
+            const double tintScale = std::max(0.01, 1.0 + pp->grade.tint / 100.0);
+            g *= tintScale;
+            params.use_camera_wb = 0;
+            params.use_auto_wb = 0;
+            params.user_mul[0] = r;
+            params.user_mul[1] = g;
+            params.user_mul[2] = b;
+            params.user_mul[3] = g;
+        } else {
+            /* A malformed/missing camera matrix is safer with as-shot WB than
+               with arbitrary channel gains. */
+            params.use_camera_wb = 1;
+            params.use_auto_wb = 0;
+            std::fill(params.user_mul, params.user_mul + 4, 0.0f);
+        }
+    } else {
+        params.use_camera_wb = 1;
+        params.use_auto_wb = 0;
+        std::fill(params.user_mul, params.user_mul + 4, 0.0f);
+    }
+
+    /* Unpack the raw data (required before processing). */
+    int ret = raw.unpack();
+    if (ret != LIBRAW_SUCCESS) {
+        pp->error = "unpack failed: ";
+        pp->error += libraw_strerror(ret);
+        return ret;
+    }
+
+    ret = raw.dcraw_process();
+    if (ret != LIBRAW_SUCCESS) {
+        pp->error = "dcraw_process failed: ";
+        pp->error += libraw_strerror(ret);
+        return ret;
+    }
+
+    libraw_processed_image_t* image = raw.dcraw_make_mem_image(&ret);
+    if (!image || ret != LIBRAW_SUCCESS) {
+        pp->error = "dcraw_make_mem_image failed: ";
+        pp->error += libraw_strerror(ret);
+        if (image) raw.dcraw_clear_mem(image);
+        return ret ? ret : LIBRAW_UNSPECIFIED_ERROR;
+    }
+
+    int W = image->width;
+    int H = image->height;
+    int sourceChans = image->colors;
+    if (image->type != LIBRAW_IMAGE_BITMAP || image->bits != outputBits ||
+        sizeof(Sample) * 8 != (size_t)outputBits || W <= 0 || H <= 0 ||
+        (sourceChans != 1 && sourceChans < 3)) {
+        pp->error = "LibRaw returned an unsupported image format";
+        raw.dcraw_clear_mem(image);
+        return LIBRAW_UNSUPPORTED_THUMBNAIL;
+    }
+
+    const size_t pixelCount = (size_t)W * (size_t)H;
+    if (pixelCount > SIZE_MAX / (size_t)sourceChans ||
+        pixelCount * (size_t)sourceChans > SIZE_MAX / sizeof(Sample) ||
+        image->data_size < pixelCount * (size_t)sourceChans * sizeof(Sample) ||
+        pixelCount > SIZE_MAX / 3) {
+        pp->error = "LibRaw returned an invalid image size";
+        raw.dcraw_clear_mem(image);
+        return LIBRAW_DATA_ERROR;
+    }
+
+    /* Normalize all LibRaw bitmap variants to packed RGB. In particular,
+       monochrome RAWs return one channel; merely pretending they have three
+       causes out-of-bounds reads in grading and denoising. */
+    const int chans = 3;
+    const double maximum = (double)((1ULL << outputBits) - 1);
+    auto sampleAt = [&](size_t index) {
+        Sample value;
+        std::memcpy(&value, image->data + index * sizeof(Sample), sizeof(Sample));
+        return value;
+    };
+    std::vector<Sample> pixels(pixelCount * chans);
+    if (sourceChans == 1) {
+        for (size_t pixel = 0; pixel < pixelCount; ++pixel) {
+            const Sample value = sampleAt(pixel);
+            pixels[pixel * 3] = value;
+            pixels[pixel * 3 + 1] = value;
+            pixels[pixel * 3 + 2] = value;
+        }
+    } else {
+        for (size_t pixel = 0; pixel < pixelCount; ++pixel) {
+            pixels[pixel * 3] = sampleAt(pixel * sourceChans);
+            pixels[pixel * 3 + 1] = sampleAt(pixel * sourceChans + 1);
+            pixels[pixel * 3 + 2] = sampleAt(pixel * sourceChans + 2);
+        }
+    }
+
+    /* Remove color speckle and dark-region grain before grading amplifies it. */
+    denoiseChroma(pixels.data(), W, H, chans, pp->denoise, maximum);
+    denoiseLuma(pixels.data(), W, H, chans, pp->denoise, maximum);
+
+    /* Post-demosaic color grading. */
+    applyGrade(pixels.data(), W, H, chans, pp->grade, maximum);
+
+    /* Downscale to max width if requested. */
+    std::vector<Sample> scaled;
+    Sample* finalPixels = pixels.data();
+    int finalW = W, finalH = H;
+    if (pp->maxWidth > 0 && W > (int)pp->maxWidth) {
+        int newW = (int)pp->maxWidth;
+        int newH = (int)((double)H * newW / W + 0.5);
+        scaled.resize((size_t)newW * newH * chans);
+        bilinearScale(pixels.data(), W, H, chans, scaled.data(), newW, newH, maximum);
+        finalPixels = scaled.data();
+        finalW = newW;
+        finalH = newH;
+    }
+
+    // ffmpeg's rgb24 input requires exactly three tightly packed channels.
+    const size_t finalPixelCount = (size_t)finalW * (size_t)finalH;
+    output.assign(finalPixels, finalPixels + finalPixelCount * 3);
+    outputWidth = finalW;
+    outputHeight = finalH;
+    raw.dcraw_clear_mem(image);
+    return LIBRAW_SUCCESS;
+}
 }  // namespace
 
 extern "C" {
@@ -360,170 +586,7 @@ void libraw_bridge_set_denoise(libraw_processor* p, double strength) {
         std::clamp(finiteOr(strength, 0.0), 0.0, 1.0);
 }
 
-static int developRGB(Processor* pp, std::vector<unsigned char>& output,
-                      int& outputWidth, int& outputHeight) {
-    pp->error.clear();
-    output.clear();
-    outputWidth = 0;
-    outputHeight = 0;
 
-    if (pp->path.empty()) {
-        pp->error = "develop failed: no RAW file is open";
-        return LIBRAW_INPUT_CLOSED;
-    }
-
-    /* unpack()/dcraw_process() are a one-shot sequence in LibRaw. Reopen the
-       saved path before a subsequent development so PNG/RGB output and grade
-       retries work on the same processor instance. */
-    if (pp->needsReload) {
-        int ret = pp->raw.open_file(pp->path.c_str());
-        if (ret != LIBRAW_SUCCESS) {
-            pp->error = "reopen failed: ";
-            pp->error += libraw_strerror(ret);
-            return ret;
-        }
-        pp->needsReload = false;
-    }
-
-    /* Once unpack starts, retry through a clean reopen even when processing
-       fails partway through. */
-    pp->needsReload = true;
-
-    LibRaw& raw = pp->raw;
-    libraw_output_params_t& params = raw.imgdata.params;
-
-    params.output_color = 1;  /* sRGB */
-    params.output_bps = 8;
-    params.output_tiff = 0;
-    params.user_flip = -1;    /* respect metadata orientation */
-    /* Do not let dcraw normalize every dark frame toward full brightness.
-       That behavior lifts the night noise floor by several stops and causes
-       frame-to-frame exposure pumping. Exposure belongs to the ramp. */
-    params.no_auto_bright = 1;
-
-    /* LibRaw expects a linear multiplier, while the public API is in EV stops.
-       Passing EV directly made 0.5 EV darken by one stop and sent negative EV
-       values outside LibRaw's valid range, which can create severe channel
-       clipping and green/magenta flashes. */
-    if (pp->grade.exposure != 0) {
-        params.exp_correc = 1;
-        params.exp_shift = std::pow(2.0, std::clamp(pp->grade.exposure, -2.0, 3.0));
-        params.exp_preser = pp->grade.exposure > 0 ? 1.0 : 0.0;
-    } else {
-        params.exp_correc = 0;
-        params.exp_shift = 1.0;
-        params.exp_preser = 0.0;
-    }
-
-    /* White balance: Kelvin + tint, else camera WB. */
-    if (pp->grade.temperature > 0) {
-        double r, g, b;
-        kelvinToRGB(pp->grade.temperature, r, g, b);
-        /* Tint: positive -> green, negative -> magenta. */
-        double tintShift = pp->grade.tint / 100.0;
-        g *= (1.0 + tintShift);
-        double mx = std::max({r, g, b});
-        if (mx > 0) { r /= mx; g /= mx; b /= mx; }
-        params.use_camera_wb = 0;
-        params.use_auto_wb = 0;
-        params.user_mul[0] = r;
-        params.user_mul[1] = g;
-        params.user_mul[2] = b;
-        params.user_mul[3] = g;
-    } else {
-        params.use_camera_wb = 1;
-    }
-
-    /* Unpack the raw data (required before processing). */
-    int ret = raw.unpack();
-    if (ret != LIBRAW_SUCCESS) {
-        pp->error = "unpack failed: ";
-        pp->error += libraw_strerror(ret);
-        return ret;
-    }
-
-    ret = raw.dcraw_process();
-    if (ret != LIBRAW_SUCCESS) {
-        pp->error = "dcraw_process failed: ";
-        pp->error += libraw_strerror(ret);
-        return ret;
-    }
-
-    libraw_processed_image_t* image = raw.dcraw_make_mem_image(&ret);
-    if (!image || ret != LIBRAW_SUCCESS) {
-        pp->error = "dcraw_make_mem_image failed: ";
-        pp->error += libraw_strerror(ret);
-        if (image) raw.dcraw_clear_mem(image);
-        return ret ? ret : LIBRAW_UNSPECIFIED_ERROR;
-    }
-
-    int W = image->width;
-    int H = image->height;
-    int sourceChans = image->colors;
-    if (image->type != LIBRAW_IMAGE_BITMAP || image->bits != 8 || W <= 0 || H <= 0 ||
-        (sourceChans != 1 && sourceChans < 3)) {
-        pp->error = "LibRaw returned an unsupported image format";
-        raw.dcraw_clear_mem(image);
-        return LIBRAW_UNSUPPORTED_THUMBNAIL;
-    }
-
-    const size_t pixelCount = (size_t)W * (size_t)H;
-    if (pixelCount > SIZE_MAX / (size_t)sourceChans ||
-        image->data_size < pixelCount * (size_t)sourceChans ||
-        pixelCount > SIZE_MAX / 3) {
-        pp->error = "LibRaw returned an invalid image size";
-        raw.dcraw_clear_mem(image);
-        return LIBRAW_DATA_ERROR;
-    }
-
-    /* Normalize all LibRaw bitmap variants to packed RGB. In particular,
-       monochrome RAWs return one channel; merely pretending they have three
-       causes out-of-bounds reads in grading and denoising. */
-    const int chans = 3;
-    std::vector<unsigned char> pixels(pixelCount * chans);
-    if (sourceChans == 1) {
-        for (size_t pixel = 0; pixel < pixelCount; ++pixel) {
-            pixels[pixel * 3] = image->data[pixel];
-            pixels[pixel * 3 + 1] = image->data[pixel];
-            pixels[pixel * 3 + 2] = image->data[pixel];
-        }
-    } else {
-        for (size_t pixel = 0; pixel < pixelCount; ++pixel) {
-            pixels[pixel * 3] = image->data[pixel * sourceChans];
-            pixels[pixel * 3 + 1] = image->data[pixel * sourceChans + 1];
-            pixels[pixel * 3 + 2] = image->data[pixel * sourceChans + 2];
-        }
-    }
-
-    /* Remove color speckle and dark-region grain before grading amplifies it. */
-    denoiseChroma(pixels.data(), W, H, chans, pp->denoise);
-    denoiseLuma(pixels.data(), W, H, chans, pp->denoise);
-
-    /* Post-demosaic color grading. */
-    applyGrade(pixels.data(), W, H, chans, pp->grade);
-
-    /* Downscale to max width if requested. */
-    std::vector<unsigned char> scaled;
-    unsigned char* finalPixels = pixels.data();
-    int finalW = W, finalH = H;
-    if (pp->maxWidth > 0 && W > (int)pp->maxWidth) {
-        int newW = (int)pp->maxWidth;
-        int newH = (int)((double)H * newW / W + 0.5);
-        scaled.resize((size_t)newW * newH * chans);
-        bilinearScale(pixels.data(), W, H, chans, scaled.data(), newW, newH);
-        finalPixels = scaled.data();
-        finalW = newW;
-        finalH = newH;
-    }
-
-    // ffmpeg's rgb24 input requires exactly three tightly packed channels.
-    const size_t finalPixelCount = (size_t)finalW * (size_t)finalH;
-    output.assign(finalPixels, finalPixels + finalPixelCount * 3);
-    outputWidth = finalW;
-    outputHeight = finalH;
-    raw.dcraw_clear_mem(image);
-    return LIBRAW_SUCCESS;
-}
 
 
 
@@ -531,7 +594,7 @@ int libraw_bridge_develop_png(libraw_processor* p, const char* out_path) {
     Processor* pp = reinterpret_cast<Processor*>(p);
     std::vector<unsigned char> pixels;
     int width = 0, height = 0;
-    int ret = developRGB(pp, pixels, width, height);
+    int ret = developRGB(pp, pixels, width, height, 8);
     if (ret != LIBRAW_SUCCESS) return ret;
     int ok = stbi_write_png(out_path, width, height, 3, pixels.data(), width * 3);
     if (!ok) {
@@ -547,7 +610,7 @@ int libraw_bridge_develop_rgb(libraw_processor* p, libraw_rgb_image* out_image) 
     Processor* pp = reinterpret_cast<Processor*>(p);
     std::vector<unsigned char> pixels;
     int width = 0, height = 0;
-    int ret = developRGB(pp, pixels, width, height);
+    int ret = developRGB(pp, pixels, width, height, 8);
     if (ret != LIBRAW_SUCCESS) return ret;
 
     uint8_t* data = static_cast<uint8_t*>(std::malloc(pixels.size()));
@@ -558,6 +621,40 @@ int libraw_bridge_develop_rgb(libraw_processor* p, libraw_rgb_image* out_image) 
     std::memcpy(data, pixels.data(), pixels.size());
     out_image->data = data;
     out_image->size = pixels.size();
+    out_image->width = (uint32_t)width;
+    out_image->height = (uint32_t)height;
+    out_image->channels = 3;
+    return LIBRAW_SUCCESS;
+}
+
+
+int libraw_bridge_develop_rgb16(libraw_processor* p, libraw_rgb16_image* out_image) {
+    if (!out_image) return LIBRAW_UNSPECIFIED_ERROR;
+    *out_image = {};
+    Processor* pp = reinterpret_cast<Processor*>(p);
+    std::vector<uint16_t> pixels;
+    int width = 0, height = 0;
+    int ret = developRGB(pp, pixels, width, height, 16);
+    if (ret != LIBRAW_SUCCESS) return ret;
+
+    if (pixels.size() > SIZE_MAX / sizeof(uint16_t)) {
+        pp->error = "16-bit RGB output is too large";
+        return LIBRAW_TOO_BIG;
+    }
+    const size_t byteCount = pixels.size() * sizeof(uint16_t);
+    uint8_t* data = static_cast<uint8_t*>(std::malloc(byteCount));
+    if (!data) {
+        pp->error = "unable to allocate 16-bit RGB output";
+        return LIBRAW_UNSUFFICIENT_MEMORY;
+    }
+    // Serialize explicitly as little-endian so the public buffer always matches
+    // FFmpeg's rgb48le format, including on big-endian hosts.
+    for (size_t index = 0; index < pixels.size(); ++index) {
+        data[index * 2] = (uint8_t)(pixels[index] & 0xff);
+        data[index * 2 + 1] = (uint8_t)(pixels[index] >> 8);
+    }
+    out_image->data = data;
+    out_image->size = byteCount;
     out_image->width = (uint32_t)width;
     out_image->height = (uint32_t)height;
     out_image->channels = 3;

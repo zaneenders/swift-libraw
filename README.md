@@ -9,7 +9,8 @@ package builds on **Linux and macOS**.
 
 It exposes a single `Libraw` class that opens a DNG/RAW file, applies a
 photographic grade (exposure, white balance, contrast, saturation, vibrance,
-shadows, highlights), and writes an 8-bit sRGB PNG.
+shadows, highlights), and produces an 8-bit sRGB PNG, packed 8-bit RGB, or
+packed 16-bit RGB suitable for a 10-bit video pipeline.
 
 ## Layout
 
@@ -51,7 +52,17 @@ dev.setGrade(.init(exposure: 1.25, temperature: 4300, tint: 5,
                    shadows: 0.2, highlights: 0.8))
 dev.setMaxWidth(3840)
 try dev.developPNG(to: "/tmp/frame.png")
+
+// Retain developed channel precision for FFmpeg/ProRes instead of quantizing
+// to the 8-bit RGB API. The byte buffer is packed little-endian rgb48le.
+let frame = try dev.developRGB16()
+// ffmpeg input: -f rawvideo -pixel_format rgb48le -video_size WIDTHxHEIGHT -i -
+// ProRes output: -vf format=yuv422p10le -c:v prores_ks -profile:v 3 master.mov
 ```
+
+`developRGB16()` asks LibRaw for 16-bit output and keeps grading, denoising,
+and scaling in 16-bit sample space. It is intended for a downstream 10-bit
+ProRes encoder; it does not imply that the source sensor has 16 effective bits.
 
 ## Notes on the grade mapping
 

@@ -73,6 +73,23 @@ public struct LibrawRGBImage: Sendable {
     }
 }
 
+/// A tightly packed 16-bit sRGB image in little-endian RGB channel order.
+///
+/// `pixels` is suitable for FFmpeg's `rgb48le` rawvideo input. Although this
+/// retains 16 bits per developed channel, the source RAW's effective precision
+/// can be lower. A 10-bit ProRes encoder will quantize these samples as needed.
+public struct LibrawRGB16Image: Sendable {
+    public let width: Int
+    public let height: Int
+    public let pixels: Data
+
+    public init(width: Int, height: Int, pixels: Data) {
+        self.width = width
+        self.height = height
+        self.pixels = pixels
+    }
+}
+
 public final class Libraw: @unchecked Sendable {
     private let handle: OpaquePointer
     private let mutex = Mutex<Void>(())
@@ -139,6 +156,27 @@ public final class Libraw: @unchecked Sendable {
             }
             defer { libraw_bridge_free_rgb(bytes) }
             return LibrawRGBImage(
+                width: Int(image.width),
+                height: Int(image.height),
+                pixels: Data(bytes: bytes, count: image.size)
+            )
+        }
+    }
+
+    /// Develop into tightly packed 16-bit sRGB samples for an `rgb48le` consumer.
+    public func developRGB16() throws -> LibrawRGB16Image {
+        try mutex.withLock { _ in
+            var image = libraw_rgb16_image()
+            let rc = libraw_bridge_develop_rgb16(handle, &image)
+            if rc != 0 {
+                let msg = libraw_bridge_last_error(handle).map { String(cString: $0) } ?? ""
+                throw LibrawError.developFailed(rc, msg)
+            }
+            guard let bytes = image.data else {
+                throw LibrawError.message("libraw returned an empty 16-bit RGB image")
+            }
+            defer { libraw_bridge_free_rgb(bytes) }
+            return LibrawRGB16Image(
                 width: Int(image.width),
                 height: Int(image.height),
                 pixels: Data(bytes: bytes, count: image.size)
