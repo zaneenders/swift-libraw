@@ -46,22 +46,52 @@ static libraw_grade sanitizeGrade(libraw_grade grade) {
     return grade;
 }
 
-/* Tanner Helland's Kelvin -> RGB approximation, returned normalized to [0,1]. */
-static void kelvinToRGB(double K, double& r, double& g, double& b) {
-    double t = K / 100.0;
-    double red, green, blue;
-    if (t <= 66) {
-        red = 255.0;
-        green = 99.4708025861 * std::log(t) - 161.1195681661;
-        blue = (t <= 19) ? 0.0 : (138.5177312231 * std::log(t - 10) - 305.0447927307);
+/* Approximate a black-body illuminant as CIE xy (Hernandez-Andres et al.).
+   White-balance gains must be calculated in the camera's native color space;
+   display-space Kelvin RGB values are not sensor multipliers. */
+static void kelvinToXYZ(double kelvin, double& x, double& y, double& z) {
+    const double T = std::clamp(kelvin, 1667.0, 25000.0);
+    if (T <= 4000.0) {
+        x = -0.2661239e9 / (T * T * T) - 0.2343589e6 / (T * T)
+            + 0.8776956e3 / T + 0.179910;
     } else {
-        red = 329.698727446 * std::pow(t - 60, -0.1332047592);
-        green = 288.1221695283 * std::pow(t - 60, -0.0755148492);
-        blue = 255.0;
+        x = -3.0258469e9 / (T * T * T) + 2.1070379e6 / (T * T)
+            + 0.2226347e3 / T + 0.240390;
     }
-    r = std::clamp(red / 255.0, 0.0, 1.0);
-    g = std::clamp(green / 255.0, 0.0, 1.0);
-    b = std::clamp(blue / 255.0, 0.0, 1.0);
+    if (T <= 2222.0) {
+        y = -1.1063814 * x * x * x - 1.34811020 * x * x + 2.18555832 * x - 0.20219683;
+    } else if (T <= 4000.0) {
+        y = -0.9549476 * x * x * x - 1.37418593 * x * x + 2.09137015 * x - 0.16748867;
+    } else {
+        y = 3.0817580 * x * x * x - 5.87338670 * x * x + 3.75112997 * x - 0.37001483;
+    }
+    const double Y = 1.0;
+    const double X = x * Y / y;
+    const double Z = (1.0 - x - y) * Y / y;
+    x = X; y = Y; z = Z;
+}
+
+static bool kelvinToCameraMultipliers(const LibRaw& raw, double kelvin,
+                                      double& r, double& g, double& b) {
+    double X, Y, Z;
+    kelvinToXYZ(kelvin, X, Y, Z);
+    const float (*cameraToXYZ)[3] = raw.imgdata.color.cam_xyz;
+    double cameraWhite[3] = {};
+    for (int channel = 0; channel < 3; ++channel) {
+        cameraWhite[channel] = cameraToXYZ[channel][0] * X
+            + cameraToXYZ[channel][1] * Y + cameraToXYZ[channel][2] * Z;
+    }
+    if (!std::isfinite(cameraWhite[0]) || !std::isfinite(cameraWhite[1])
+        || !std::isfinite(cameraWhite[2]) || cameraWhite[0] <= 0
+        || cameraWhite[1] <= 0 || cameraWhite[2] <= 0) {
+        return false;
+    }
+    r = 1.0 / cameraWhite[0];
+    g = 1.0 / cameraWhite[1];
+    b = 1.0 / cameraWhite[2];
+    const double minimum = std::min({r, g, b});
+    r /= minimum; g /= minimum; b /= minimum;
+    return true;
 }
 
 template <typename Sample>
@@ -384,23 +414,32 @@ static int developRGB(Processor* pp, std::vector<Sample>& output,
         params.exp_preser = 0.0;
     }
 
-    /* White balance: Kelvin + tint, else camera WB. */
+    /* White balance: convert the requested illuminant through the DNG camera
+       matrix. Feeding display-space RGB directly to user_mul caused the strong
+       green cast seen at otherwise ordinary temperatures such as 5200 K. */
     if (pp->grade.temperature > 0) {
         double r, g, b;
-        kelvinToRGB(pp->grade.temperature, r, g, b);
-        /* Tint: positive -> green, negative -> magenta. */
-        double tintShift = pp->grade.tint / 100.0;
-        g *= (1.0 + tintShift);
-        double mx = std::max({r, g, b});
-        if (mx > 0) { r /= mx; g /= mx; b /= mx; }
-        params.use_camera_wb = 0;
-        params.use_auto_wb = 0;
-        params.user_mul[0] = r;
-        params.user_mul[1] = g;
-        params.user_mul[2] = b;
-        params.user_mul[3] = g;
+        if (kelvinToCameraMultipliers(raw, pp->grade.temperature, r, g, b)) {
+            /* Tint: positive -> green, negative -> magenta. */
+            const double tintScale = std::max(0.01, 1.0 + pp->grade.tint / 100.0);
+            g *= tintScale;
+            params.use_camera_wb = 0;
+            params.use_auto_wb = 0;
+            params.user_mul[0] = r;
+            params.user_mul[1] = g;
+            params.user_mul[2] = b;
+            params.user_mul[3] = g;
+        } else {
+            /* A malformed/missing camera matrix is safer with as-shot WB than
+               with arbitrary channel gains. */
+            params.use_camera_wb = 1;
+            params.use_auto_wb = 0;
+            std::fill(params.user_mul, params.user_mul + 4, 0.0f);
+        }
     } else {
         params.use_camera_wb = 1;
+        params.use_auto_wb = 0;
+        std::fill(params.user_mul, params.user_mul + 4, 0.0f);
     }
 
     /* Unpack the raw data (required before processing). */
