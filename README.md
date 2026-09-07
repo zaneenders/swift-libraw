@@ -1,5 +1,7 @@
 # swift-libraw
 
+[![CI](https://github.com/zaneenders/swift-libraw/actions/workflows/ci.yml/badge.svg)](https://github.com/zaneenders/swift-libraw/actions/workflows/ci.yml)
+
 A cross-platform Swift wrapper around [LibRaw](https://github.com/LibRaw/LibRaw),
 the open-source RAW image decoder. LibRaw is vendored as a git submodule and
 compiled directly by Swift Package Manager — no separate build step. The same
